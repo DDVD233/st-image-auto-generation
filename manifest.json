@@ -3,9 +3,9 @@
     "requires": [],
     "optional": [],
     "js": "index.js",
-    "author": "wickedcode01",
+    "author": "ddvd233",
     "version": "1.0.5",
-    "homePage": "https://github.com/wickedcode01/st-image-auto-generation",
+    "homePage": "https://github.com/ddvd233/st-image-auto-generation",
     "auto_update": true,
     "i18n": {
         "zh-cn": "i18n/zh-cn.json"
