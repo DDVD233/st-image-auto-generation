@@ -64,17 +64,19 @@ function unescapeHtmlAttribute(value) {
 }
 
 /**
- * Converts the <img> tags this extension generated in REPLACE mode back into
- * their original <pic prompt="..."> form. Only tags carrying our data-pic-gen
- * marker are touched, so user/character images are left untouched.
+ * Restores the <img> tags this extension generated in REPLACE mode back to the
+ * exact original tag the model emitted (stored verbatim in data-pic-gen). This
+ * is format-agnostic, so it works with any custom prompt template / regex. Only
+ * tags carrying our data-pic-gen marker are touched, so user/character images
+ * are left untouched.
  * @param {string} content
  * @returns {string}
  */
 function restorePicTags(content) {
     return content.replace(
         /<img\b[^>]*?\sdata-pic-gen="([^"]*)"[^>]*>/g,
-        (_match, escapedPrompt) =>
-            `<pic prompt="${unescapeHtmlAttribute(escapedPrompt)}">`,
+        (_match, escapedOriginalTag) =>
+            unescapeHtmlAttribute(escapedOriginalTag),
     );
 }
 
@@ -342,8 +344,9 @@ eventSource.on(
                 return;
             }
 
-            // 行内替换模式下，将我们生成的 <img> 标签还原成 <pic prompt="...">，
-            // 这样发送给模型的历史里只会出现 <pic> 标签，避免模型在多轮后学着直接输出 <img>。
+            // 行内替换模式下，将我们生成的 <img> 标签还原成模型最初输出的原始标签
+            //（存放在 data-pic-gen 中，兼容用户自定义的提示词/正则格式），
+            // 这样发送给模型的历史里不会出现 <img>，避免模型在多轮后学着直接输出 <img>。
             if (
                 extension_settings[extensionName].insertType ===
                     INSERT_TYPE.REPLACE &&
@@ -527,10 +530,15 @@ async function handleIncomingMessage() {
                             if (!originalTag) {
                                 continue;
                             }
-                            // Replace it with an actual image tag
+                            // Replace it with an actual image tag. Stash the
+                            // original tag verbatim in data-pic-gen so we can
+                            // restore it later regardless of the user's custom
+                            // prompt/regex format.
                             const escapedUrl = escapeHtmlAttribute(imageUrl);
                             const escapedPrompt = escapeHtmlAttribute(prompt);
-                            const newImageTag = `<img src="${escapedUrl}" title="${escapedPrompt}" alt="${escapedPrompt}" data-pic-gen="${escapedPrompt}">`;
+                            const escapedOriginalTag =
+                                escapeHtmlAttribute(originalTag);
+                            const newImageTag = `<img src="${escapedUrl}" title="${escapedPrompt}" alt="${escapedPrompt}" data-pic-gen="${escapedOriginalTag}">`;
                             message.mes = message.mes.replace(
                                 originalTag,
                                 newImageTag,
