@@ -9,6 +9,8 @@ import {
     eventSource,
     event_types,
     updateMessageBlock,
+    chat,
+    streamingProcessor,
 } from '../../../../script.js';
 import { appendMediaToMessage } from '../../../../script.js';
 import { regexFromString } from '../../../utils.js';
@@ -80,6 +82,11 @@ function restorePicTags(content) {
     );
 }
 
+// A generated <img> tag, captured so that split() keeps it. Its data-pic-gen holds
+// the original tag, which in a custom format may have nothing to escape and so
+// still match the regex: these must be skipped when working with tags.
+const GENERATED_IMAGE_REGEX = /(<img\b[^>]*?\sdata-pic-gen="[^"]*"[^>]*>)/g;
+
 /**
  * Ensures message.extra.image_swipes always exists and is an array.
  * @param {any} message
@@ -100,6 +107,7 @@ function ensureImageSwipes(message) {
 // 默认设置
 const defaultSettings = {
     insertType: INSERT_TYPE.DISABLED,
+    streamGeneration: true,
     promptInjection: {
         enabled: true,
         prompt: `<image_generation>
@@ -123,6 +131,10 @@ function updateUI() {
     if ($('#image_generation_insert_type').length) {
         $('#image_generation_insert_type').val(
             extension_settings[extensionName].insertType,
+        );
+        $('#stream_generation_enabled').prop(
+            'checked',
+            extension_settings[extensionName].streamGeneration,
         );
         $('#prompt_injection_enabled').prop(
             'checked',
@@ -174,6 +186,12 @@ async function loadSettings() {
             extension_settings[extensionName].insertType =
                 defaultSettings.insertType;
         }
+
+        // 确保streamGeneration属性存在
+        if (extension_settings[extensionName].streamGeneration === undefined) {
+            extension_settings[extensionName].streamGeneration =
+                defaultSettings.streamGeneration;
+        }
     }
 
     updateUI();
@@ -196,6 +214,12 @@ async function createSettings(settingsHtml) {
         const newValue = $(this).val();
         extension_settings[extensionName].insertType = newValue;
         updateUI();
+        saveSettingsDebounced();
+    });
+
+    $('#stream_generation_enabled').on('change', function () {
+        extension_settings[extensionName].streamGeneration =
+            $(this).prop('checked');
         saveSettingsDebounced();
     });
 
@@ -406,6 +430,329 @@ eventSource.on(
     },
 );
 
+/**
+ * @typedef {object} ImageJob
+ * @property {string} tag The tag as it appears in message.mes
+ * @property {string} prompt The prompt captured from the tag
+ * @property {string} [imageTag] REPLACE mode: the finished <img> tag
+ */
+
+/**
+ * The image tags found in one message.
+ * @typedef {object} ImageSession
+ * @property {any} message The chat message the tags belong to
+ * @property {any} processor The StreamingProcessor writing the message, if any
+ * @property {Map<string, ImageJob>} jobs Jobs by tag; identical tags share an image
+ * @property {string} [scannedText] The text the last stream scan looked at
+ * @property {boolean} cancelled Set when a swipe has replaced the message text
+ */
+
+// The session of the message being streamed (or the last one that was)
+/** @type {ImageSession|null} */
+let streamSession = null;
+// One image at a time: the sd command swaps global dimensions while it runs
+let imageQueue = Promise.resolve();
+let pendingImageCount = 0;
+let generatedImageCount = 0;
+
+/**
+ * @param {any} message
+ * @param {any} [processor]
+ * @returns {ImageSession}
+ */
+function createImageSession(message, processor = null) {
+    return { message, processor, jobs: new Map(), cancelled: false };
+}
+
+/**
+ * While this is true ST rewrites message.mes on every tick, so anything written
+ * to it would be lost.
+ * @param {ImageSession} session
+ * @returns {boolean}
+ */
+function isSessionStreaming({ processor }) {
+    return !!processor && !processor.isFinished && !processor.isStopped;
+}
+
+/**
+ * @param {string} text
+ * @returns {RegExpMatchArray[]}
+ */
+function findImageTags(text) {
+    // 使用正则表达式search
+    const imgTagRegex = regexFromString(
+        extension_settings[extensionName].promptInjection.regex,
+    );
+    if (!imgTagRegex) {
+        return [];
+    }
+    const searchText = text.replace(GENERATED_IMAGE_REGEX, '');
+    if (imgTagRegex.global) {
+        return [...searchText.matchAll(imgTagRegex)];
+    }
+    const singleMatch = searchText.match(imgTagRegex);
+    return singleMatch ? [singleMatch] : [];
+}
+
+/**
+ * Swaps the tags of finished REPLACE jobs for their <img> tags.
+ * @param {string} text
+ * @param {Map<string, ImageJob>} jobs
+ * @returns {string}
+ */
+function substituteImageTags(text, jobs) {
+    for (const { tag, imageTag } of jobs.values()) {
+        if (imageTag) {
+            text = text
+                .split(GENERATED_IMAGE_REGEX)
+                .map((part, index) =>
+                    // Odd parts are the generated tags. The replacer function
+                    // keeps "$" in the prompt literal.
+                    index % 2 ? part : part.replaceAll(tag, () => imageTag),
+                )
+                .join('');
+        }
+    }
+    return text;
+}
+
+/**
+ * Writes the finished REPLACE images into message.mes and saves them.
+ * @param {ImageSession} session
+ */
+async function commitReplacedImages({ message, jobs }) {
+    const messageId = chat.indexOf(message);
+    const replaced = substituteImageTags(message.mes, jobs);
+    if (messageId === -1 || replaced === message.mes) {
+        return;
+    }
+    message.mes = replaced;
+
+    // Update the message display using updateMessageBlock
+    updateMessageBlock(messageId, message);
+    await eventSource.emit(event_types.MESSAGE_UPDATED, messageId);
+
+    // Save the chat
+    await getContext().saveChat();
+}
+
+/**
+ * Adds a generated image to the media of a message.
+ * @param {any} message
+ * @param {string} prompt
+ * @param {string} imageUrl
+ */
+function insertInlineImage(message, prompt, imageUrl) {
+    // 统一插入到extra里
+    const imageSwipes = ensureImageSwipes(message);
+
+    // 如果已有图片，添加到swipes（新版ST的extra.media已包含这些图片）
+    if (
+        !Array.isArray(message.extra.media) &&
+        message.extra.image &&
+        !imageSwipes.includes(message.extra.image)
+    ) {
+        imageSwipes.push(message.extra.image);
+    }
+
+    // 添加图片到swipes数组
+    imageSwipes.push(imageUrl);
+
+    // 设置第一张图片为主图片，或更新为最新生成的图片
+    message.extra.image = imageUrl;
+    message.extra.title = prompt;
+    message.extra.inline_image = true;
+
+    // 更新UI
+    appendMediaToMessage(
+        message,
+        $(`.mes[mesid="${chat.indexOf(message)}"]`),
+    );
+}
+
+/**
+ * Generates one queued image and puts it in the message.
+ * @param {ImageSession} session
+ * @param {ImageJob} job
+ */
+async function runImageJob(session, job) {
+    const isSessionGone = () =>
+        session.cancelled || !chat.includes(session.message);
+
+    try {
+        const insertType = extension_settings[extensionName].insertType;
+        if (insertType === INSERT_TYPE.DISABLED || isSessionGone()) {
+            return;
+        }
+
+        // @ts-ignore
+        const imageUrl = await SlashCommandParser.commands['sd'].callback(
+            {
+                quiet: insertType === INSERT_TYPE.NEW_MESSAGE ? 'false' : 'true',
+            },
+            job.prompt,
+        );
+        if (typeof imageUrl !== 'string' || imageUrl.trim().length === 0) {
+            return;
+        }
+        generatedImageCount++;
+        if (isSessionGone()) {
+            return;
+        }
+
+        // During a stream ST saves the chat itself once the stream ends
+        if (insertType === INSERT_TYPE.INLINE) {
+            insertInlineImage(session.message, job.prompt, imageUrl);
+            if (!isSessionStreaming(session)) {
+                await getContext().saveChat();
+            }
+        } else if (insertType === INSERT_TYPE.REPLACE) {
+            // Stash the original tag verbatim in data-pic-gen so we can restore
+            // it later regardless of the user's custom prompt/regex format.
+            const escapedUrl = escapeHtmlAttribute(imageUrl);
+            const escapedPrompt = escapeHtmlAttribute(job.prompt);
+            const escapedOriginalTag = escapeHtmlAttribute(job.tag);
+            job.imageTag = `<img src="${escapedUrl}" title="${escapedPrompt}" alt="${escapedPrompt}" data-pic-gen="${escapedOriginalTag}">`;
+
+            // Mid-stream, the next tick renders it through renderFinishedImages
+            if (!isSessionStreaming(session)) {
+                await commitReplacedImages(session);
+            }
+        }
+    } catch (error) {
+        toastr.error(`Image generation error: ${error}`);
+        console.error('Image generation error:', error);
+    } finally {
+        if (--pendingImageCount === 0 && generatedImageCount > 0) {
+            toastr.success(
+                `${generatedImageCount} images generated successfully`,
+            );
+        }
+    }
+}
+
+/**
+ * Queues generation for the matched tags the session hasn't seen yet.
+ * @param {ImageSession} session
+ * @param {RegExpMatchArray[]} matches
+ */
+function enqueueImageTags(session, matches) {
+    for (const match of matches) {
+        const tag = typeof match?.[0] === 'string' ? match[0] : '';
+        const prompt = typeof match?.[1] === 'string' ? match[1] : '';
+        if (!tag || !prompt.trim() || session.jobs.has(tag)) {
+            continue;
+        }
+
+        const job = { tag, prompt };
+        session.jobs.set(tag, job);
+
+        if (pendingImageCount++ === 0) {
+            generatedImageCount = 0;
+            toastr.info('Generating images...');
+        }
+        imageQueue = imageQueue.then(() => runImageJob(session, job));
+    }
+}
+
+/**
+ * Finds the session for a stream that is writing to the given message.
+ * @param {any} processor
+ * @param {any} message
+ * @returns {ImageSession}
+ */
+function getStreamSession(processor, message) {
+    if (streamSession?.processor === processor) {
+        return streamSession;
+    }
+
+    const previous = streamSession?.message === message ? streamSession : null;
+    if (processor.type === 'continue') {
+        // Keep the earlier jobs: ST writes the old text back on every tick, so
+        // their images still need rendering and committing. Tags already in the
+        // message have been handled, so must not generate again.
+        streamSession = previous ?? createImageSession(message);
+        streamSession.processor = processor;
+        for (const [tag] of findImageTags(message.mes)) {
+            if (!streamSession.jobs.has(tag)) {
+                streamSession.jobs.set(tag, { tag, prompt: '' });
+            }
+        }
+        return streamSession;
+    }
+
+    // A swipe replaces the text, so images for the old text are no longer wanted
+    if (previous) {
+        previous.cancelled = true;
+    }
+    streamSession = createImageSession(message, processor);
+    return streamSession;
+}
+
+// 流式传输时一旦检测到完整标签就开始生成图片
+eventSource.on(event_types.STREAM_TOKEN_RECEIVED, handleStreamToken);
+function handleStreamToken() {
+    const settings = extension_settings[extensionName];
+    if (
+        !settings?.streamGeneration ||
+        !settings.promptInjection?.regex ||
+        // Create New Message posts to the chat, which would put the image in
+        // the middle of the message still being streamed: wait for it to end.
+        ![INSERT_TYPE.INLINE, INSERT_TYPE.REPLACE].includes(settings.insertType)
+    ) {
+        return;
+    }
+
+    const processor = streamingProcessor;
+    const message = chat[processor?.messageId];
+    if (!message || processor.type === 'impersonate') {
+        return;
+    }
+
+    const session = getStreamSession(processor, message);
+
+    // message.mes rather than the raw stream text: it has reasoning stripped, so
+    // tags in <think> don't count, and its tags match the final message.
+    const text = message.mes;
+    if (session.scannedText === text) {
+        return;
+    }
+    session.scannedText = text;
+
+    // A match touching the end of the text may not be final: it could still be
+    // growing, or end on a quote ST added to balance an unfinished one.
+    enqueueImageTags(
+        session,
+        findImageTags(text).filter(
+            (match) => match.index + match[0].length < match.input.length,
+        ),
+    );
+}
+
+/**
+ * Shows finished REPLACE images while message.mes still holds the tags, without
+ * changing the text itself.
+ * @param {string} mes
+ * @param {{ messageId: number, isReasoning: boolean }} ctx
+ * @returns {string}
+ */
+function renderFinishedImages(mes, ctx) {
+    if (
+        !streamSession ||
+        ctx.isReasoning ||
+        chat[ctx.messageId] !== streamSession.message
+    ) {
+        return mes;
+    }
+    return substituteImageTags(mes, streamSession.jobs);
+}
+
+// Not available on older ST: there, images appear when the stream ends
+const { messageFormatter } = getContext();
+messageFormatter?.addHook(renderFinishedImages, {
+    stage: messageFormatter.stage.BEFORE_REGEX,
+});
+
 // 监听消息接收事件
 eventSource.on(event_types.MESSAGE_RECEIVED, handleIncomingMessage);
 async function handleIncomingMessage() {
@@ -414,14 +761,6 @@ async function handleIncomingMessage() {
         !extension_settings[extensionName] ||
         extension_settings[extensionName].insertType === INSERT_TYPE.DISABLED
     ) {
-        return;
-    }
-
-    const context = getContext();
-    const message = context.chat[context.chat.length - 1];
-
-    // 检查是否是AI消息
-    if (!message || message.is_user) {
         return;
     }
 
@@ -434,138 +773,22 @@ async function handleIncomingMessage() {
         return;
     }
 
-    // 使用正则表达式search
-    const imgTagRegex = regexFromString(
-        extension_settings[extensionName].promptInjection.regex,
-    );
-    // const testRegex = regexFromString(extension_settings[extensionName].promptInjection.regex);
-    let matches;
-    if (imgTagRegex.global) {
-        matches = [...message.mes.matchAll(imgTagRegex)];
-    } else {
-        const singleMatch = message.mes.match(imgTagRegex);
-        matches = singleMatch ? [singleMatch] : [];
+    const isStreamedMessage =
+        !!streamingProcessor &&
+        streamSession?.processor === streamingProcessor &&
+        !isSessionStreaming(streamSession);
+    const session = isStreamedMessage
+        ? streamSession
+        : createImageSession(chat[chat.length - 1]);
+
+    // 检查是否是AI消息
+    if (!session.message || session.message.is_user) {
+        return;
     }
-    console.log(imgTagRegex, matches);
-    if (matches.length > 0) {
-        // 延迟执行图片生成，确保消息首先显示出来
-        setTimeout(async () => {
-            try {
-                toastr.info(`Generating ${matches.length} images...`);
-                const insertType = extension_settings[extensionName].insertType;
 
-                // 在当前消息中插入图片
-                // 初始化message.extra
-                if (!message.extra) {
-                    message.extra = {};
-                }
+    enqueueImageTags(session, findImageTags(session.message.mes));
 
-                const imageSwipes = ensureImageSwipes(message);
-
-                // 如果已有图片，添加到swipes
-                if (
-                    message.extra.image &&
-                    !imageSwipes.includes(message.extra.image)
-                ) {
-                    imageSwipes.push(message.extra.image);
-                }
-
-                // 获取消息元素用于稍后更新
-                const messageElement = $(
-                    `.mes[mesid="${context.chat.length - 1}"]`,
-                );
-
-                // 处理每个匹配的图片标签
-                for (const match of matches) {
-                    const prompt =
-                        typeof match?.[1] === 'string' ? match[1] : '';
-                    if (!prompt.trim()) {
-                        continue;
-                    }
-
-                    // @ts-ignore
-                    const result = await SlashCommandParser.commands[
-                        'sd'
-                    ].callback(
-                        {
-                            quiet:
-                                insertType === INSERT_TYPE.NEW_MESSAGE
-                                    ? 'false'
-                                    : 'true',
-                        },
-                        prompt,
-                    );
-                    // 统一插入到extra里
-                    if (insertType === INSERT_TYPE.INLINE) {
-                        let imageUrl = result;
-                        if (
-                            typeof imageUrl === 'string' &&
-                            imageUrl.trim().length > 0
-                        ) {
-                            const currentImageSwipes = ensureImageSwipes(message);
-
-                            // 添加图片到swipes数组
-                            currentImageSwipes.push(imageUrl);
-
-                            // 设置第一张图片为主图片，或更新为最新生成的图片
-                            message.extra.image = imageUrl;
-                            message.extra.title = prompt;
-                            message.extra.inline_image = true;
-
-                            // 更新UI
-                            appendMediaToMessage(message, messageElement);
-
-                            // 保存聊天记录
-                            await context.saveChat();
-                        }
-                    } else if (insertType === INSERT_TYPE.REPLACE) {
-                        let imageUrl = result;
-                        if (
-                            typeof imageUrl === 'string' &&
-                            imageUrl.trim().length > 0
-                        ) {
-                            // Find the original image tag in the message
-                            const originalTag =
-                                typeof match?.[0] === 'string' ? match[0] : '';
-                            if (!originalTag) {
-                                continue;
-                            }
-                            // Replace it with an actual image tag. Stash the
-                            // original tag verbatim in data-pic-gen so we can
-                            // restore it later regardless of the user's custom
-                            // prompt/regex format.
-                            const escapedUrl = escapeHtmlAttribute(imageUrl);
-                            const escapedPrompt = escapeHtmlAttribute(prompt);
-                            const escapedOriginalTag =
-                                escapeHtmlAttribute(originalTag);
-                            const newImageTag = `<img src="${escapedUrl}" title="${escapedPrompt}" alt="${escapedPrompt}" data-pic-gen="${escapedOriginalTag}">`;
-                            message.mes = message.mes.replace(
-                                originalTag,
-                                newImageTag,
-                            );
-
-                            // Update the message display using updateMessageBlock
-                            updateMessageBlock(
-                                context.chat.length - 1,
-                                message,
-                            );
-                            await eventSource.emit(
-                                event_types.MESSAGE_UPDATED,
-                                context.chat.length - 1,
-                            );
-
-                            // Save the chat
-                            await context.saveChat();
-                        }
-                    }
-                }
-                toastr.success(
-                    `${matches.length} images generated successfully`,
-                );
-            } catch (error) {
-                toastr.error(`Image generation error: ${error}`);
-                console.error('Image generation error:', error);
-            }
-        }, 0); //防阻塞UI渲染
-    }
+    // ST has just rewritten message.mes for the last time, so images that were
+    // only being rendered can now go in for good.
+    await commitReplacedImages(session);
 }

@@ -8,5 +8,6 @@
     "Enable Prompt Injection": "启用提示注入",
     "Prompt Template": "提示模板",
     "Regex": "正则表达式",
-    "Inline Replace Mode": "行内替换模式"
+    "Inline Replace Mode": "行内替换模式",
+    "Generate While Streaming": "流式传输时生成"
 }

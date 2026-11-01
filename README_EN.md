@@ -22,6 +22,7 @@ This extension automatically generates images when it detects `<pic prompt="..."
   - Insert into current message (inserts into ST's extra array, supports image controls)
   - Inline replacement mode (directly replaces the corresponding tag, does not support image controls)
   - Create new messages with generated images (ST's default image generation method, best compatibility)
+- Generates images while the reply is streaming, as soon as each tag is complete. Turn off "Generate While Streaming" to wait for the reply to finish, for example if text and image generation share a GPU. "Create new messages" always waits, since it can't post a message in the middle of one still being written
 - Simple toggle in the extensions menu
 - Configuration panel in the Extensions settings
 - Customizable prompt template and regexp
