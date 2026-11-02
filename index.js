@@ -44,7 +44,10 @@ function escapeHtmlAttribute(value) {
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;')
         .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
+        .replace(/>/g, '&gt;')
+        // A line break inside the tag would make markdown split it up and show
+        // it as text.
+        .replace(/\r?\n/g, '&#10;');
 }
 
 /**
@@ -58,6 +61,7 @@ function unescapeHtmlAttribute(value) {
     }
 
     return value
+        .replace(/&#10;/g, '\n')
         .replace(/&quot;/g, '"')
         .replace(/&#39;/g, "'")
         .replace(/&lt;/g, '<')
@@ -71,14 +75,24 @@ function unescapeHtmlAttribute(value) {
  * is format-agnostic, so it works with any custom prompt template / regex. Only
  * tags carrying our data-pic-gen marker are touched, so user/character images
  * are left untouched.
+ *
+ * Images saved by earlier versions only have the prompt in data-pic-gen, which
+ * is how they differ from newer ones: it's the same as their title. Those go
+ * back to a <pic prompt="..."> tag, or the model would see a bare prompt.
+ *
+ * Unclosed tags go back closed, or the model would copy them from its history.
  * @param {string} content
  * @returns {string}
  */
 function restorePicTags(content) {
     return content.replace(
         /<img\b[^>]*?\sdata-pic-gen="([^"]*)"[^>]*>/g,
-        (_match, escapedOriginalTag) =>
-            unescapeHtmlAttribute(escapedOriginalTag),
+        (match, escapedValue) => {
+            const value = unescapeHtmlAttribute(escapedValue);
+            return match.includes(` title="${escapedValue}"`)
+                ? `<pic prompt="${value}">`
+                : value.replace(UNCLOSED_TAG_REGEX, '<pic prompt="$1">');
+        },
     );
 }
 
@@ -86,6 +100,13 @@ function restorePicTags(content) {
 // the original tag, which in a custom format may have nothing to escape and so
 // still match the regex: these must be skipped when working with tags.
 const GENERATED_IMAGE_REGEX = /(<img\b[^>]*?\sdata-pic-gen="[^"]*"[^>]*>)/g;
+
+// A tag the model left unclosed: <pic prompt="...</pic>, or <pic prompt="...> at the
+// end of a paragraph. The usual regex would run on to the next quote in the text,
+// taking the text in between as the prompt and swallowing any tags after it. A ">"
+// elsewhere doesn't count: valid prompts can have them, as in <lora:name:1>.
+const UNCLOSED_TAG_REGEX =
+    /<pic\b[^>]*\sprompt="([^"]*?)(?:<\/pic>|>(?=\s*\n\s*\n|$))/g;
 
 /**
  * Ensures message.extra.image_swipes always exists and is an array.
@@ -487,11 +508,13 @@ function findImageTags(text) {
         return [];
     }
     const searchText = text.replace(GENERATED_IMAGE_REGEX, '');
+    const unclosedTags = [...searchText.matchAll(UNCLOSED_TAG_REGEX)];
+    const closedText = searchText.replace(UNCLOSED_TAG_REGEX, '');
     if (imgTagRegex.global) {
-        return [...searchText.matchAll(imgTagRegex)];
+        return [...unclosedTags, ...closedText.matchAll(imgTagRegex)];
     }
-    const singleMatch = searchText.match(imgTagRegex);
-    return singleMatch ? [singleMatch] : [];
+    const singleMatch = closedText.match(imgTagRegex);
+    return singleMatch ? [...unclosedTags, singleMatch] : unclosedTags;
 }
 
 /**
@@ -614,7 +637,7 @@ async function runImageJob(session, job) {
             const escapedOriginalTag = escapeHtmlAttribute(job.tag);
             job.imageTag = `<img src="${escapedUrl}" title="${escapedPrompt}" alt="${escapedPrompt}" data-pic-gen="${escapedOriginalTag}">`;
 
-            // Mid-stream, the next tick renders it through renderFinishedImages
+            // Mid-stream, the next tick renders it through renderImageTags
             if (!isSessionStreaming(session)) {
                 await commitReplacedImages(session);
             }
@@ -731,25 +754,27 @@ function handleStreamToken() {
 
 /**
  * Shows finished REPLACE images while message.mes still holds the tags, without
- * changing the text itself.
+ * changing the text itself. Tags that are unclosed get closed for display, since
+ * the browser would take the text up to the next quote as part of the tag and hide
+ * it, for as long as the tag is there: until its image is ready, or for good.
  * @param {string} mes
  * @param {{ messageId: number, isReasoning: boolean }} ctx
  * @returns {string}
  */
-function renderFinishedImages(mes, ctx) {
-    if (
-        !streamSession ||
-        ctx.isReasoning ||
-        chat[ctx.messageId] !== streamSession.message
-    ) {
+function renderImageTags(mes, ctx) {
+    if (ctx.isReasoning) {
         return mes;
     }
-    return substituteImageTags(mes, streamSession.jobs);
+    const text =
+        chat[ctx.messageId] === streamSession?.message
+            ? substituteImageTags(mes, streamSession.jobs)
+            : mes;
+    return text.replace(UNCLOSED_TAG_REGEX, '<pic prompt="$1">');
 }
 
 // Not available on older ST: there, images appear when the stream ends
 const { messageFormatter } = getContext();
-messageFormatter?.addHook(renderFinishedImages, {
+messageFormatter?.addHook(renderImageTags, {
     stage: messageFormatter.stage.BEFORE_REGEX,
 });
 
