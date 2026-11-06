@@ -817,3 +817,346 @@ async function handleIncomingMessage() {
     // only being rendered can now go in for good.
     await commitReplacedImages(session);
 }
+
+// ---------------------------------------------------------------------------
+// Image swipes (Inline Replace mode)
+//
+// Each generated <img> can hold several variants of its image, newest last, in
+// data-pic-swipes; src is the one shown. They live in the tag itself, so every
+// image keeps its own, and restorePicTags still sends only the original tag to
+// the model. Images without data-pic-swipes have a single variant: their src.
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads an attribute from a generated <img> tag in message.mes.
+ * @param {string} tag
+ * @param {string} name
+ * @returns {string|null} The unescaped value, or null when it's missing
+ */
+function getTagAttribute(tag, name) {
+    const match = tag.match(new RegExp(`\\s${name}="([^"]*)"`));
+    return match ? unescapeHtmlAttribute(match[1]) : null;
+}
+
+/**
+ * Sets an attribute on a generated <img> tag, adding it if it's missing. Values
+ * are escaped, so no quote inside one can be mistaken for the end of another.
+ * @param {string} tag
+ * @param {string} name
+ * @param {string} value
+ * @returns {string}
+ */
+function setTagAttribute(tag, name, value) {
+    const attribute = ` ${name}="${escapeHtmlAttribute(value)}"`;
+    const pattern = new RegExp(`\\s${name}="[^"]*"`);
+    return pattern.test(tag)
+        ? tag.replace(pattern, () => attribute)
+        : tag.replace(/\/?>$/, () => `${attribute}>`);
+}
+
+/**
+ * @param {string|null} src
+ * @param {string|null} swipesValue The data-pic-swipes value
+ * @returns {{ swipes: string[], index: number }}
+ */
+function parseImageSwipes(src, swipesValue) {
+    const swipes = swipesValue ? swipesValue.split('\n').filter(Boolean) : [];
+    if (src && !swipes.includes(src)) {
+        swipes.push(src);
+    }
+    return { swipes, index: Math.max(0, swipes.indexOf(src ?? '')) };
+}
+
+/**
+ * A generated <img> tag in message.mes.
+ * @typedef {object} LocatedImage
+ * @property {number} start Offset of the tag in message.mes
+ * @property {string} tag
+ * @property {string[]} swipes
+ * @property {number} index The variant being shown
+ */
+
+/**
+ * Finds the generated <img> tags in a message, in the order they're displayed.
+ * @param {any} message
+ * @returns {LocatedImage[]}
+ */
+function findGeneratedImages(message) {
+    if (typeof message?.mes !== 'string') {
+        return [];
+    }
+    return [...message.mes.matchAll(GENERATED_IMAGE_REGEX)].map((match) => ({
+        start: match.index,
+        tag: match[0],
+        ...parseImageSwipes(
+            getTagAttribute(match[0], 'src'),
+            getTagAttribute(match[0], 'data-pic-swipes'),
+        ),
+    }));
+}
+
+/**
+ * Finds an image again after the message may have changed. Its first variant
+ * identifies it, since every generation gets a new file. Identical tags share an
+ * image, so the position tells them apart.
+ * @param {any} message
+ * @param {string} originalUrl
+ * @param {number} position
+ * @returns {{ image: LocatedImage, position: number } | null}
+ */
+function relocateImage(message, originalUrl, position) {
+    const images = findGeneratedImages(message);
+    if (images[position]?.swipes[0] === originalUrl) {
+        return { image: images[position], position };
+    }
+    const found = images.findIndex((image) => image.swipes[0] === originalUrl);
+    return found === -1 ? null : { image: images[found], position: found };
+}
+
+/**
+ * Shows another variant of an image and saves it to the message.
+ * @param {any} message
+ * @param {number} position
+ * @param {LocatedImage} image
+ * @param {string[]} swipes
+ * @param {number} index
+ */
+async function showImageVariant(message, position, image, swipes, index) {
+    let tag = setTagAttribute(image.tag, 'src', swipes[index]);
+    if (swipes.length > 1) {
+        tag = setTagAttribute(tag, 'data-pic-swipes', swipes.join('\n'));
+    }
+    message.mes =
+        message.mes.slice(0, image.start) +
+        tag +
+        message.mes.slice(image.start + image.tag.length);
+
+    const messageId = chat.indexOf(message);
+    const img = $(`#chat .mes[mesid="${messageId}"] .mes_text img[data-pic-gen]`)
+        .get(position);
+    if (img instanceof HTMLImageElement) {
+        // Load it before swapping, so the old one stays until it can be shown
+        // and the message doesn't collapse and jump in between.
+        await new Promise((resolve) => {
+            const preload = new Image();
+            preload.onload = preload.onerror = resolve;
+            preload.src = swipes[index];
+        });
+        // Another click may have moved on while this one was loading
+        const current = findGeneratedImages(message)[position];
+        if (current && getTagAttribute(current.tag, 'src') !== swipes[index]) {
+            return;
+        }
+        img.src = swipes[index];
+        img.dataset.picSwipes = swipes.join('\n');
+        updateSwipeControls(img);
+    }
+
+    await getContext().saveChat();
+}
+
+// Images being regenerated, by message and first variant
+/** @type {WeakMap<object, Set<string>>} */
+const regeneratingImages = new WeakMap();
+
+/**
+ * @param {any} message
+ * @param {string} originalUrl
+ * @returns {boolean}
+ */
+function isRegenerating(message, originalUrl) {
+    return !!regeneratingImages.get(message)?.has(originalUrl);
+}
+
+/**
+ * Generates a new variant of an image with another seed and shows it.
+ * @param {any} message
+ * @param {number} position
+ * @param {LocatedImage} image
+ */
+async function regenerateImage(message, position, image) {
+    const prompt = getTagAttribute(image.tag, 'title');
+    if (!prompt?.trim()) {
+        toastr.warning('No prompt found for this image');
+        return;
+    }
+
+    const originalUrl = image.swipes[0];
+    if (!regeneratingImages.has(message)) {
+        regeneratingImages.set(message, new Set());
+    }
+    regeneratingImages.get(message).add(originalUrl);
+    refreshSwipeControls(message);
+
+    // Queued with the other images: the sd command swaps global settings
+    const generation = imageQueue.then(async () => {
+        const args = { quiet: 'true' };
+        // A fixed seed would give back the same image. A random one (-1) is
+        // already new each time.
+        // @ts-ignore
+        if (Number(extension_settings.sd?.seed) >= 0) {
+            args.seed = String(Math.floor(Math.random() * 2 ** 32));
+        }
+        // @ts-ignore
+        return SlashCommandParser.commands['sd'].callback(args, prompt);
+    });
+    imageQueue = generation.catch(() => {});
+
+    try {
+        const imageUrl = await generation;
+        if (typeof imageUrl !== 'string' || imageUrl.trim().length === 0) {
+            return;
+        }
+
+        // The message may have been edited, swiped or deleted meanwhile
+        const located = chat.includes(message)
+            ? relocateImage(message, originalUrl, position)
+            : null;
+        if (!located) {
+            return;
+        }
+        const swipes = [...located.image.swipes, imageUrl];
+        await showImageVariant(
+            message,
+            located.position,
+            located.image,
+            swipes,
+            swipes.length - 1,
+        );
+    } catch (error) {
+        toastr.error(`Image generation error: ${error}`);
+        console.error('Image generation error:', error);
+    } finally {
+        regeneratingImages.get(message)?.delete(originalUrl);
+        refreshSwipeControls(message);
+    }
+}
+
+/**
+ * Handles a click on an arrow under an image.
+ * @param {HTMLElement} button
+ * @param {number} direction -1 for left, 1 for right
+ */
+async function onImageSwipe(button, direction) {
+    const wrapper = button.closest('.pic-gen-swipe');
+    const img = wrapper?.querySelector('img[data-pic-gen]');
+    const messageElement = wrapper?.closest('.mes');
+    const message = chat[Number(messageElement?.getAttribute('mesid'))];
+    if (!img || !message) {
+        return;
+    }
+
+    const position = $(messageElement)
+        .find('.mes_text img[data-pic-gen]')
+        .index(img);
+    const image = findGeneratedImages(message)[position];
+    // Not in message.mes yet: still being written by a stream
+    if (!image ||
+        getTagAttribute(image.tag, 'data-pic-gen') !== img.getAttribute('data-pic-gen')) {
+        return;
+    }
+    if (isRegenerating(message, image.swipes[0])) {
+        return;
+    }
+
+    const index = image.index + direction;
+    if (index < 0) {
+        return;
+    }
+    if (index < image.swipes.length) {
+        await showImageVariant(message, position, image, image.swipes, index);
+    } else {
+        await regenerateImage(message, position, image);
+    }
+}
+
+/**
+ * Updates the counter and arrows under an image from its attributes.
+ * @param {HTMLImageElement} img
+ */
+function updateSwipeControls(img) {
+    const wrapper = img.closest('.pic-gen-swipe');
+    if (!wrapper) {
+        return;
+    }
+    const { swipes, index } = parseImageSwipes(
+        img.getAttribute('src'),
+        img.dataset.picSwipes ?? null,
+    );
+    const message = chat[Number(img.closest('.mes')?.getAttribute('mesid'))];
+    const busy = isRegenerating(message, swipes[0]);
+
+    $(wrapper).find('.pic-gen-swipe-counter').text(`${index + 1}/${swipes.length}`);
+    $(wrapper).find('.pic-gen-swipe-left').toggleClass('disabled', busy || index === 0);
+    $(wrapper)
+        .find('.pic-gen-swipe-right')
+        .toggleClass('disabled', busy)
+        .toggleClass('fa-chevron-right', !busy)
+        .toggleClass('fa-spinner fa-spin', busy);
+}
+
+/**
+ * @param {any} message
+ */
+function refreshSwipeControls(message) {
+    const messageId = chat.indexOf(message);
+    $(`#chat .mes[mesid="${messageId}"] .mes_text .pic-gen-swipe img[data-pic-gen]`)
+        .each((_, img) => updateSwipeControls(/** @type {HTMLImageElement} */ (img)));
+}
+
+/**
+ * Puts arrows and a counter under each generated image that doesn't have them.
+ * ST renders a message from scratch whenever it changes, so this runs after
+ * every change to the chat.
+ */
+function addSwipeControls() {
+    for (const img of document.querySelectorAll('#chat .mes_text img[data-pic-gen]')) {
+        if (!(img instanceof HTMLImageElement) ||
+            img.parentElement?.classList.contains('pic-gen-swipe')) {
+            continue;
+        }
+        // Mid-stream the message is redrawn on every tick and isn't saved yet
+        const message = chat[Number(img.closest('.mes')?.getAttribute('mesid'))];
+        if (!message || (streamSession?.message === message &&
+            isSessionStreaming(streamSession))) {
+            continue;
+        }
+
+        const wrapper = $('<span class="pic-gen-swipe"></span>');
+        $(img).before(wrapper);
+        wrapper.append(
+            img,
+            $(`<span class="pic-gen-swipe-controls">
+                <span class="pic-gen-swipe-left fa-solid fa-chevron-left" title="Previous image"></span>
+                <span class="pic-gen-swipe-counter"></span>
+                <span class="pic-gen-swipe-right fa-solid fa-chevron-right" title="Next image, or generate a new one"></span>
+            </span>`),
+        );
+        updateSwipeControls(img);
+    }
+}
+
+$(document).on('click', '.pic-gen-swipe-left:not(.disabled)', function () {
+    onImageSwipe(this, -1);
+});
+$(document).on('click', '.pic-gen-swipe-right:not(.disabled)', function () {
+    onImageSwipe(this, 1);
+});
+
+$(function () {
+    const chatElement = document.getElementById('chat');
+    if (!chatElement) {
+        return;
+    }
+    let scheduled = false;
+    new MutationObserver(() => {
+        if (!scheduled) {
+            scheduled = true;
+            requestAnimationFrame(() => {
+                scheduled = false;
+                addSwipeControls();
+            });
+        }
+    }).observe(chatElement, { childList: true, subtree: true });
+    addSwipeControls();
+});

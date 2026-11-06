@@ -3,6 +3,7 @@
     "requires": [],
     "optional": [],
     "js": "index.js",
+    "css": "style.css",
     "author": "wickedcode01",
     "version": "1.0.5",
     "homePage": "https://github.com/wickedcode01/st-image-auto-generation",

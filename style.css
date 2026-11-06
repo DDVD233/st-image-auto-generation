@@ -1,0 +1,46 @@
+/* Arrows and counter under images generated in Inline Replace mode */
+.mes_text .pic-gen-swipe {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    max-width: 100%;
+    vertical-align: top;
+}
+
+.mes_text .pic-gen-swipe-controls {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.75em;
+    margin-top: 0.25em;
+    font-size: 0.9em;
+    opacity: 0.7;
+    user-select: none;
+}
+
+.mes_text .pic-gen-swipe-controls:hover {
+    opacity: 1;
+}
+
+.mes_text .pic-gen-swipe-left,
+.mes_text .pic-gen-swipe-right {
+    cursor: pointer;
+    padding: 0.25em 0.5em;
+}
+
+.mes_text .pic-gen-swipe-left.disabled,
+.mes_text .pic-gen-swipe-right.disabled {
+    cursor: default;
+    opacity: 0.35;
+}
+
+/* The spinner is busy, not unavailable */
+.mes_text .pic-gen-swipe-right.disabled.fa-spinner {
+    opacity: 1;
+}
+
+.mes_text .pic-gen-swipe-counter {
+    min-width: 3em;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+}
